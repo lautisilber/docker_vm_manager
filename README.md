@@ -38,7 +38,9 @@ installed `vm` and removes it — so it finds the script regardless of where
 ## Usage
 
 ```
-vm create <name> <image>   Create a new VM from a Docker image, with persistent storage
+vm create <name> <image> [options]  Create a new VM from a Docker image, with persistent storage
+  --platform <platform>              Force a specific platform, e.g. linux/amd64 (useful when
+                                      an image has no native build for your CPU architecture)
 vm start <name> [options]   Start the VM (if needed) and open an interactive shell
   -k, --keep-running           Leave the VM running in the background after the shell exits
                                 (default: stop the VM when the shell exits)
@@ -72,6 +74,14 @@ vm stop dev          # stop it explicitly later
 ```
 
 Stop every VM at once with `vm stop -a` / `vm stop --all`.
+
+If an image doesn't publish a build for your CPU architecture (common with
+`archlinux` on Apple Silicon / arm64), force Docker to run it under
+emulation with `--platform`:
+
+```sh
+vm create arch archlinux --platform linux/amd64
+```
 
 ## How it works
 

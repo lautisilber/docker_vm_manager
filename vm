@@ -63,7 +63,17 @@ pick_shell() {
 # ---------------------------------------------------------------------------
 
 cmd_create() {
-  local name="${1:-}" image="${2:-}"
+  local name="" image="" platform=""
+  local positional=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --platform) platform="${2:-}"; [[ -n "$platform" ]] || err "--platform requires a value (e.g. linux/amd64)."; shift 2 ;;
+      -*) err "Unknown option '$1' for 'vm create'." ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+  name="${positional[0]:-}"
+  image="${positional[1]:-}"
   [[ -n "$name" && -n "$image" ]] || { usage; exit 1; }
   validate_name "$name"
   vm_exists "$name" && err "VM '$name' already exists."
@@ -75,8 +85,16 @@ cmd_create() {
   echo "Creating persistent volume '$vname'..."
   docker volume create "$vname" >/dev/null
 
-  echo "Creating VM '$name' from image '$image'..."
+  local platform_args=()
+  if [[ -n "$platform" ]]; then
+    platform_args=(--platform "$platform")
+    echo "Creating VM '$name' from image '$image' (platform: $platform)..."
+  else
+    echo "Creating VM '$name' from image '$image'..."
+  fi
+
   docker create \
+    ${platform_args[@]+"${platform_args[@]}"} \
     --name "$cname" \
     --label "$LABEL" \
     --label "vmm.name=$name" \
@@ -217,7 +235,9 @@ usage() {
 vm - manage Docker containers as persistent "virtual machines"
 
 Usage:
-  vm create <name> <image>   Create a new VM from a Docker image, with persistent storage
+  vm create <name> <image> [options]  Create a new VM from a Docker image, with persistent storage
+    --platform <platform>       Force a specific platform, e.g. linux/amd64 (useful when an
+                                 image has no native build for your CPU architecture)
   vm start <name> [options]  Start the VM (if needed) and open an interactive shell
     -k, --keep-running          Leave the VM running in the background after the shell exits
                                  (default: stop the VM when the shell exits)
@@ -229,6 +249,7 @@ Usage:
 
 Examples:
   vm create dev ubuntu:22.04
+  vm create dev archlinux --platform linux/amd64   # image has no arm64 build
   vm start dev              # shell exits -> VM stops
   vm start dev -k           # shell exits -> VM keeps running in the background
   vm stop dev
