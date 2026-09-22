@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+#
+# vm - manage Docker containers like lightweight persistent "virtual machines"
+#
+set -euo pipefail
+
+PREFIX="vmm"                      # namespaces containers/volumes owned by this tool
+LABEL="vmm.managed=true"
+DATA_MOUNT="/data"                # where persistent storage is mounted inside the VM
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+err() { echo "Error: $*" >&2; exit 1; }
+
+need_docker() {
+  command -v docker >/dev/null 2>&1 || err "docker is not installed or not on PATH."
+  docker info >/dev/null 2>&1 || err "docker daemon is not running or not accessible."
+}
+
+validate_name() {
+  local name="$1"
+  [[ -n "$name" ]] || err "VM name must not be empty."
+  [[ "$name" =~ ^[a-zA-Z0-9][a-zA-Z0-9_.-]*$ ]] \
+    || err "VM name '$name' is invalid. Use letters, digits, '-', '_', '.' (must start with alphanumeric)."
+}
+
+container_name() { echo "${PREFIX}-$1"; }
+volume_name()    { echo "${PREFIX}-$1-data"; }
+
+vm_exists() {
+  docker ps -a --filter "name=^/$(container_name "$1")\$" --filter "label=$LABEL" \
+    --format '{{.Names}}' | grep -qx "$(container_name "$1")"
+}
+
+vm_running() {
+  docker ps --filter "name=^/$(container_name "$1")\$" --filter "label=$LABEL" \
+    --format '{{.Names}}' | grep -qx "$(container_name "$1")"
+}
+
+require_vm_exists() {
+  vm_exists "$1" || err "VM '$1' does not exist. Run 'vm list' to see available VMs."
+}
+
+# pick an available shell inside a running container
+pick_shell() {
+  local cname="$1"
+  if docker exec "$cname" sh -c 'command -v bash' >/dev/null 2>&1; then
+    echo "bash"
+  else
+    echo "sh"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+
+cmd_create() {
+  local name="${1:-}" image="${2:-}"
+  [[ -n "$name" && -n "$image" ]] || { usage; exit 1; }
+  validate_name "$name"
+  vm_exists "$name" && err "VM '$name' already exists."
+
+  local cname vname
+  cname="$(container_name "$name")"
+  vname="$(volume_name "$name")"
+
+  echo "Creating persistent volume '$vname'..."
+  docker volume create "$vname" >/dev/null
+
+  echo "Creating VM '$name' from image '$image'..."
+  docker create \
+    --name "$cname" \
+    --label "$LABEL" \
+    --label "vmm.name=$name" \
+    --volume "$vname:$DATA_MOUNT" \
+    --entrypoint tail \
+    "$image" -f /dev/null >/dev/null
+
+  echo "VM '$name' created. Persistent storage mounted at '$DATA_MOUNT'."
+  echo "Start it with: vm start $name"
+}
+
+cmd_start() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || { usage; exit 1; }
+  require_vm_exists "$name"
+
+  local cname
+  cname="$(container_name "$name")"
+
+  if ! vm_running "$name"; then
+    echo "Starting VM '$name'..."
+    docker start "$cname" >/dev/null
+  fi
+
+  local shell
+  shell="$(pick_shell "$cname")"
+  echo "Opening $shell in VM '$name' (ctrl-d or 'exit' to leave the VM running in the background)..."
+  exec docker exec -it "$cname" "$shell"
+}
+
+cmd_stop() {
+  local name="${1:-}"
+  [[ -n "$name" ]] || { usage; exit 1; }
+  require_vm_exists "$name"
+
+  if vm_running "$name"; then
+    echo "Stopping VM '$name'..."
+    docker stop "$(container_name "$name")" >/dev/null
+  else
+    echo "VM '$name' is already stopped."
+  fi
+}
+
+cmd_list() {
+  local names
+  names="$(docker ps -a --filter "label=$LABEL" --format '{{.Names}}' | sort || true)"
+
+  if [[ -z "$names" ]]; then
+    echo "No VMs found. Create one with: vm create <name> <image>"
+    return
+  fi
+
+  printf "%-20s %-30s %-10s %-25s\n" "NAME" "IMAGE" "STATUS" "VOLUME"
+  while IFS= read -r cname; do
+    local name image status vname
+    name="${cname#${PREFIX}-}"
+    image="$(docker inspect --format '{{.Config.Image}}' "$cname")"
+    status="$(docker inspect --format '{{.State.Status}}' "$cname")"
+    vname="$(volume_name "$name")"
+    printf "%-20s %-30s %-10s %-25s\n" "$name" "$image" "$status" "$vname"
+  done <<< "$names"
+}
+
+cmd_delete() {
+  local name="${1:-}"
+  shift || true
+  [[ -n "$name" ]] || { usage; exit 1; }
+  require_vm_exists "$name"
+
+  local purge=false yes=false
+  for arg in "$@"; do
+    case "$arg" in
+      --purge) purge=true ;;
+      -y|--yes) yes=true ;;
+      *) err "Unknown option '$arg' for 'vm delete'." ;;
+    esac
+  done
+
+  local cname vname
+  cname="$(container_name "$name")"
+  vname="$(volume_name "$name")"
+
+  if [[ "$purge" == true && "$yes" != true ]]; then
+    read -r -p "This will permanently delete the data volume for '$name'. Continue? [y/N] " reply
+    [[ "$reply" =~ ^[Yy]$ ]] || { echo "Aborted."; return; }
+  fi
+
+  echo "Deleting VM '$name'..."
+  docker rm -f "$cname" >/dev/null
+
+  if [[ "$purge" == true ]]; then
+    docker volume rm "$vname" >/dev/null
+    echo "VM '$name' and its persistent data have been deleted."
+  else
+    echo "VM '$name' deleted. Persistent data kept in volume '$vname' (use --purge to remove it)."
+  fi
+}
+
+usage() {
+  cat <<EOF
+vm - manage Docker containers as persistent "virtual machines"
+
+Usage:
+  vm create <name> <image>   Create a new VM from a Docker image, with persistent storage
+  vm start <name>            Start the VM (if needed) and open an interactive shell
+  vm stop <name>             Stop the VM (data and container are kept)
+  vm list                    List all VMs
+  vm delete <name> [options] Delete a VM
+    -y, --yes                 Skip confirmation prompt
+    --purge                    Also delete the VM's persistent data volume
+
+Examples:
+  vm create dev ubuntu:22.04
+  vm start dev
+  vm stop dev
+  vm list
+  vm delete dev --purge
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# entrypoint
+# ---------------------------------------------------------------------------
+
+main() {
+  local cmd="${1:-}"
+  [[ -n "$cmd" ]] || { usage; exit 1; }
+  shift || true
+
+  need_docker
+
+  case "$cmd" in
+    create) cmd_create "$@" ;;
+    start)  cmd_start "$@" ;;
+    stop)   cmd_stop "$@" ;;
+    list)   cmd_list "$@" ;;
+    delete) cmd_delete "$@" ;;
+    -h|--help|help) usage ;;
+    *) echo "Unknown command: $cmd" >&2; usage; exit 1 ;;
+  esac
+}
+
+main "$@"
