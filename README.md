@@ -11,19 +11,38 @@ stop it, and come back later with your data intact.
 
 ## Install
 
-Make the script executable and put it on your `PATH`:
+```sh
+make install
+```
+
+This copies `vm` into `~/.local/bin` (no `sudo` needed). If that directory
+isn't already on your `PATH`, the install prints the line to add to your
+shell profile (e.g. `~/.zshrc`).
+
+To install elsewhere, override `BINDIR`:
 
 ```sh
-chmod +x vm
-sudo ln -s "$(pwd)/vm" /usr/local/bin/vm
+make install BINDIR=/usr/local/bin   # system-wide, may need sudo
 ```
+
+To remove it:
+
+```sh
+make uninstall
+```
+
+`uninstall` searches every directory on your `PATH` (plus `BINDIR`) for an
+installed `vm` and removes it — so it finds the script regardless of where
+`make install` put it, without touching an unrelated `vm` command.
 
 ## Usage
 
 ```
 vm create <name> <image>   Create a new VM from a Docker image, with persistent storage
-vm start <name>             Start the VM (if needed) and open an interactive shell
-vm stop <name>               Stop the VM (data and container are kept)
+vm start <name> [options]   Start the VM (if needed) and open an interactive shell
+  -k, --keep-running           Leave the VM running in the background after the shell exits
+                                (default: stop the VM when the shell exits)
+vm stop <name | -a | --all>  Stop the VM, or all VMs (data and container are kept)
 vm list                      List all VMs
 vm delete <name> [options]   Delete a VM
   -y, --yes                    Skip confirmation prompt
@@ -36,12 +55,23 @@ vm delete <name> [options]   Delete a VM
 vm create dev ubuntu:22.04
 vm start dev        # opens a shell inside the VM
 # ... do stuff, files under /data persist across stop/start ...
-exit
-vm stop dev
-vm start dev         # same container, same shell history/filesystem state
+exit                 # VM stops automatically
+vm start dev         # same container, same filesystem state
 vm list
 vm delete dev --purge
 ```
+
+Pass `-k`/`--keep-running` to leave the VM running in the background after
+you exit the shell, instead of stopping it:
+
+```sh
+vm start dev -k
+exit                 # VM keeps running
+vm list              # shows it as "running"
+vm stop dev          # stop it explicitly later
+```
+
+Stop every VM at once with `vm stop -a` / `vm stop --all`.
 
 ## How it works
 

@@ -29,6 +29,11 @@ validate_name() {
 container_name() { echo "${PREFIX}-$1"; }
 volume_name()    { echo "${PREFIX}-$1-data"; }
 
+# names of all VMs managed by this tool (prefix stripped)
+all_vm_names() {
+  docker ps -a --filter "label=$LABEL" --format '{{.Names}}' | sed "s/^${PREFIX}-//" | sort
+}
+
 vm_exists() {
   docker ps -a --filter "name=^/$(container_name "$1")\$" --filter "label=$LABEL" \
     --format '{{.Names}}' | grep -qx "$(container_name "$1")"
@@ -84,7 +89,14 @@ cmd_create() {
 }
 
 cmd_start() {
-  local name="${1:-}"
+  local name="" keep_running=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -k|--keep-running|-b|--background) keep_running=true; shift ;;
+      -*) err "Unknown option '$1' for 'vm start'." ;;
+      *) name="$1"; shift ;;
+    esac
+  done
   [[ -n "$name" ]] || { usage; exit 1; }
   require_vm_exists "$name"
 
@@ -98,20 +110,50 @@ cmd_start() {
 
   local shell
   shell="$(pick_shell "$cname")"
-  echo "Opening $shell in VM '$name' (ctrl-d or 'exit' to leave the VM running in the background)..."
-  exec docker exec -it "$cname" "$shell"
+  if [[ "$keep_running" == true ]]; then
+    echo "Opening $shell in VM '$name' (ctrl-d or 'exit' to leave the VM running in the background)..."
+  else
+    echo "Opening $shell in VM '$name' (ctrl-d or 'exit' will stop the VM)..."
+  fi
+
+  local status=0
+  docker exec -it "$cname" "$shell" || status=$?
+
+  if [[ "$keep_running" != true ]]; then
+    echo "Stopping VM '$name'..."
+    docker stop "$cname" >/dev/null
+  fi
+
+  exit "$status"
 }
 
-cmd_stop() {
-  local name="${1:-}"
-  [[ -n "$name" ]] || { usage; exit 1; }
-  require_vm_exists "$name"
-
+stop_one() {
+  local name="$1"
   if vm_running "$name"; then
     echo "Stopping VM '$name'..."
     docker stop "$(container_name "$name")" >/dev/null
   else
     echo "VM '$name' is already stopped."
+  fi
+}
+
+cmd_stop() {
+  local arg="${1:-}"
+  [[ -n "$arg" ]] || { usage; exit 1; }
+
+  if [[ "$arg" == "-a" || "$arg" == "--all" ]]; then
+    local names
+    names="$(all_vm_names)"
+    if [[ -z "$names" ]]; then
+      echo "No VMs found."
+      return
+    fi
+    while IFS= read -r name; do
+      stop_one "$name"
+    done <<< "$names"
+  else
+    require_vm_exists "$arg"
+    stop_one "$arg"
   fi
 }
 
@@ -176,8 +218,10 @@ vm - manage Docker containers as persistent "virtual machines"
 
 Usage:
   vm create <name> <image>   Create a new VM from a Docker image, with persistent storage
-  vm start <name>            Start the VM (if needed) and open an interactive shell
-  vm stop <name>             Stop the VM (data and container are kept)
+  vm start <name> [options]  Start the VM (if needed) and open an interactive shell
+    -k, --keep-running          Leave the VM running in the background after the shell exits
+                                 (default: stop the VM when the shell exits)
+  vm stop <name | -a | --all> Stop the VM, or all VMs (data and container are kept)
   vm list                    List all VMs
   vm delete <name> [options] Delete a VM
     -y, --yes                 Skip confirmation prompt
@@ -185,8 +229,10 @@ Usage:
 
 Examples:
   vm create dev ubuntu:22.04
-  vm start dev
+  vm start dev              # shell exits -> VM stops
+  vm start dev -k           # shell exits -> VM keeps running in the background
   vm stop dev
+  vm stop --all
   vm list
   vm delete dev --purge
 EOF
