@@ -8,6 +8,90 @@ PREFIX="vmm"                      # namespaces containers/volumes owned by this 
 LABEL="vmm.managed=true"
 DATA_MOUNT="/data"                # where persistent storage is mounted inside the VM
 
+# SSH agent forwarding: a container can't bind-mount the host's live agent
+# socket directly (unsupported by Docker Desktop's VirtioFS file sharing on
+# macOS), so instead we bridge it over TCP via host.docker.internal:
+#   host ssh-agent (UNIX) <-relay-> 127.0.0.1:$port (TCP) <-relay-> VM's own
+#   UNIX socket at $SSH_AGENT_CONTAINER_SOCK, which $SSH_AUTH_SOCK points to
+# One relay hop runs on the host, the other inside the container; each side
+# picks whichever of socat/python3 it has available.
+SSH_AGENT_CONTAINER_SOCK="/tmp/.vmm-ssh-agent.sock"
+SSH_AGENT_CONTAINER_PIDFILE="/tmp/.vmm-ssh-agent.pid"
+
+# deterministic per-VM loopback port so repeated starts reuse the same relay
+ssh_agent_port() {
+  echo $(( 20000 + $(printf '%s' "$1" | cksum | cut -d' ' -f1) % 10000 ))
+}
+
+# Generic bidirectional relay, used on whichever side (host or container)
+# lacks socat. Args: "unix:<path>|tcp:<host>:<port>" for listen and connect.
+read -r -d '' SSH_AGENT_RELAY_PY <<'PYEOF' || true
+import os, socket, sys, threading
+
+def parse(spec):
+    kind, _, rest = spec.partition(':')
+    if kind == 'unix':
+        return ('unix', rest)
+    if kind == 'tcp':
+        host, _, port = rest.rpartition(':')
+        return ('tcp', (host or '127.0.0.1', int(port)))
+    raise ValueError('bad spec: ' + spec)
+
+listen_kind, listen_addr = parse(sys.argv[1])
+connect_kind, connect_addr = parse(sys.argv[2])
+
+if listen_kind == 'unix':
+    try:
+        os.unlink(listen_addr)
+    except FileNotFoundError:
+        pass
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    server.bind(listen_addr)
+    os.chmod(listen_addr, 0o600)
+else:
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(listen_addr)
+server.listen(16)
+
+def pipe(src, dst):
+    try:
+        while True:
+            data = src.recv(4096)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        for s in (src, dst):
+            try:
+                s.close()
+            except OSError:
+                pass
+
+def connect_upstream():
+    if connect_kind == 'unix':
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    else:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.connect(connect_addr)
+    return s
+
+def handle(conn):
+    try:
+        upstream = connect_upstream()
+    except OSError:
+        conn.close()
+        return
+    threading.Thread(target=pipe, args=(conn, upstream), daemon=True).start()
+    threading.Thread(target=pipe, args=(upstream, conn), daemon=True).start()
+
+while True:
+    conn, _ = server.accept()
+    threading.Thread(target=handle, args=(conn,), daemon=True).start()
+PYEOF
+
 # ---------------------------------------------------------------------------
 # helpers
 # ---------------------------------------------------------------------------
@@ -58,6 +142,156 @@ pick_shell() {
   fi
 }
 
+# host-side directory holding a VM's host-relay pid file
+ssh_agent_host_dir() { echo "$HOME/.vmm/ssh-agent/$1"; }
+
+wait_for_tcp_port() {
+  local host="$1" port="$2" tries="${3:-30}" i=0
+  while [[ $i -lt $tries ]]; do
+    if (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null; then
+      exec 3>&- 2>/dev/null || true
+      return 0
+    fi
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+wait_for_unix_socket_in_container() {
+  local cname="$1" path="$2" tries="${3:-30}" i=0
+  while [[ $i -lt $tries ]]; do
+    docker exec "$cname" sh -c "[ -S '$path' ]" >/dev/null 2>&1 && return 0
+    sleep 0.1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+host_relay_alive() {
+  local pidfile="$1" pid
+  [[ -f "$pidfile" ]] || return 1
+  pid="$(cat "$pidfile" 2>/dev/null || true)"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+container_relay_alive() {
+  docker exec "$1" sh -c \
+    "[ -f '$SSH_AGENT_CONTAINER_PIDFILE' ] && kill -0 \$(cat '$SSH_AGENT_CONTAINER_PIDFILE') 2>/dev/null" \
+    >/dev/null 2>&1
+}
+
+# start a live relay from the VM's own SSH_AUTH_SOCK to the host's current
+# ssh-agent (via a loopback TCP hop through host.docker.internal), if one
+# isn't already running for this VM. No-op (with an explanatory message) if
+# there's nothing to forward or no way to relay it.
+ensure_ssh_agent_forward() {
+  local name="$1" cname
+  cname="$(container_name "$name")"
+
+  if [[ -z "${SSH_AUTH_SOCK:-}" || ! -S "$SSH_AUTH_SOCK" ]]; then
+    echo "No SSH agent detected on host (\$SSH_AUTH_SOCK unset or not a socket); skipping SSH agent forwarding."
+    echo "  Start one with: eval \"\$(ssh-agent)\" && ssh-add"
+    return
+  fi
+
+  local host_backend=""
+  if command -v socat >/dev/null 2>&1; then
+    host_backend="socat"
+  elif command -v python3 >/dev/null 2>&1; then
+    host_backend="python3"
+  else
+    echo "Neither socat nor python3 found on host; skipping SSH agent forwarding (install socat, e.g. 'brew install socat')."
+    return
+  fi
+
+  local container_backend=""
+  if docker exec "$cname" sh -c 'command -v socat' >/dev/null 2>&1; then
+    container_backend="socat"
+  elif docker exec "$cname" sh -c 'command -v python3' >/dev/null 2>&1; then
+    container_backend="python3"
+  else
+    echo "VM '$name' has neither socat nor python3 installed, so the SSH agent can't be forwarded into it."
+    echo "  Install one inside the VM (e.g. 'apk add socat', 'apt install socat', 'pacman -S socat')."
+    return
+  fi
+
+  local agent_dir pidfile port
+  agent_dir="$(ssh_agent_host_dir "$name")"
+  mkdir -p "$agent_dir"
+  chmod 700 "$agent_dir" 2>/dev/null || true
+  pidfile="$agent_dir/host-relay.pid"
+  port="$(ssh_agent_port "$name")"
+
+  if host_relay_alive "$pidfile" && container_relay_alive "$cname"; then
+    echo "SSH agent forwarding already active for '$name'."
+    return
+  fi
+
+  stop_ssh_agent_forward "$name"
+
+  local hpid
+  if [[ "$host_backend" == "socat" ]]; then
+    socat "TCP-LISTEN:$port,bind=127.0.0.1,reuseaddr,fork" "UNIX-CONNECT:$SSH_AUTH_SOCK" >/dev/null 2>&1 &
+    hpid=$!
+  else
+    printf '%s\n' "$SSH_AGENT_RELAY_PY" > "$agent_dir/relay.py"
+    python3 "$agent_dir/relay.py" "tcp:127.0.0.1:$port" "unix:$SSH_AUTH_SOCK" >/dev/null 2>&1 &
+    hpid=$!
+  fi
+  disown "$hpid" 2>/dev/null || true
+  echo "$hpid" > "$pidfile"
+
+  if ! wait_for_tcp_port 127.0.0.1 "$port" 30; then
+    echo "Warning: failed to set up the host side of SSH agent forwarding; continuing without it." >&2
+    kill "$hpid" 2>/dev/null || true
+    rm -f "$pidfile"
+    return
+  fi
+
+  if [[ "$container_backend" == "python3" ]]; then
+    docker cp "$agent_dir/relay.py" "$cname:/tmp/.vmm-relay.py" >/dev/null 2>&1
+    docker exec -d "$cname" sh -c \
+      "echo \$\$ > '$SSH_AGENT_CONTAINER_PIDFILE'; exec python3 /tmp/.vmm-relay.py 'unix:$SSH_AGENT_CONTAINER_SOCK' 'tcp:host.docker.internal:$port'" \
+      >/dev/null 2>&1
+  else
+    docker exec -d "$cname" sh -c \
+      "echo \$\$ > '$SSH_AGENT_CONTAINER_PIDFILE'; exec socat UNIX-LISTEN:$SSH_AGENT_CONTAINER_SOCK,fork,unlink-early TCP:host.docker.internal:$port" \
+      >/dev/null 2>&1
+  fi
+
+  if ! wait_for_unix_socket_in_container "$cname" "$SSH_AGENT_CONTAINER_SOCK" 30; then
+    echo "Warning: failed to set up the in-VM side of SSH agent forwarding; continuing without it." >&2
+    echo "  If this VM was created before SSH agent forwarding support was added, recreate it (vm delete, then vm create)." >&2
+    kill "$hpid" 2>/dev/null || true
+    rm -f "$pidfile"
+    return
+  fi
+
+  echo "Forwarding host SSH agent into VM via $host_backend/$container_backend."
+}
+
+# stop a VM's agent relay (both hops) and clean up pid files; safe to call
+# even if forwarding was never set up. The in-container hop normally dies on
+# its own when the container stops, but this also handles killing it while
+# the container is still running.
+stop_ssh_agent_forward() {
+  local name="$1" cname agent_dir pidfile pid
+  cname="$(container_name "$name")"
+  agent_dir="$(ssh_agent_host_dir "$name")"
+  pidfile="$agent_dir/host-relay.pid"
+
+  if [[ -f "$pidfile" ]]; then
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+  fi
+  rm -f "$pidfile"
+
+  docker exec "$cname" sh -c \
+    "[ -f '$SSH_AGENT_CONTAINER_PIDFILE' ] && kill \$(cat '$SSH_AGENT_CONTAINER_PIDFILE') 2>/dev/null; rm -f '$SSH_AGENT_CONTAINER_PIDFILE' '$SSH_AGENT_CONTAINER_SOCK'" \
+    >/dev/null 2>&1 || true
+}
+
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
@@ -99,6 +333,8 @@ cmd_create() {
     --label "$LABEL" \
     --label "vmm.name=$name" \
     --volume "$vname:$DATA_MOUNT" \
+    --add-host "host.docker.internal:host-gateway" \
+    --env "SSH_AUTH_SOCK=$SSH_AGENT_CONTAINER_SOCK" \
     --entrypoint tail \
     "$image" -f /dev/null >/dev/null
 
@@ -107,10 +343,11 @@ cmd_create() {
 }
 
 cmd_start() {
-  local name="" keep_running=false
+  local name="" keep_running=false share_ssh=false
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -k|--keep-running|-b|--background) keep_running=true; shift ;;
+      --share-ssh) share_ssh=true; shift ;;
       -*) err "Unknown option '$1' for 'vm start'." ;;
       *) name="$1"; shift ;;
     esac
@@ -124,6 +361,10 @@ cmd_start() {
   if ! vm_running "$name"; then
     echo "Starting VM '$name'..."
     docker start "$cname" >/dev/null
+  fi
+
+  if [[ "$share_ssh" == true ]]; then
+    ensure_ssh_agent_forward "$name"
   fi
 
   local shell
@@ -140,6 +381,7 @@ cmd_start() {
   if [[ "$keep_running" != true ]]; then
     echo "Stopping VM '$name'..."
     docker stop "$cname" >/dev/null
+    stop_ssh_agent_forward "$name"
   fi
 
   exit "$status"
@@ -153,6 +395,7 @@ stop_one() {
   else
     echo "VM '$name' is already stopped."
   fi
+  stop_ssh_agent_forward "$name"
 }
 
 cmd_stop() {
@@ -221,6 +464,8 @@ cmd_delete() {
 
   echo "Deleting VM '$name'..."
   docker rm -f "$cname" >/dev/null
+  stop_ssh_agent_forward "$name"
+  rm -rf "$(ssh_agent_host_dir "$name")"
 
   if [[ "$purge" == true ]]; then
     docker volume rm "$vname" >/dev/null
@@ -241,7 +486,11 @@ Usage:
   vm start <name> [options]  Start the VM (if needed) and open an interactive shell
     -k, --keep-running          Leave the VM running in the background after the shell exits
                                  (default: stop the VM when the shell exits)
-  vm stop <name | -a | --all> Stop the VM, or all VMs (data and container are kept)
+    --share-ssh                  Forward the host's SSH agent into the VM, so it can ssh out
+                                 anywhere the host can, using the host's keys without them
+                                 ever being copied into the VM (default: off)
+  vm stop <name | -a | --all> Stop the VM, or all VMs (data and container are kept; also
+                               tears down its SSH agent forwarding, if any)
   vm list                    List all VMs
   vm delete <name> [options] Delete a VM
     -y, --yes                 Skip confirmation prompt
@@ -252,6 +501,7 @@ Examples:
   vm create dev archlinux --platform linux/amd64   # image has no arm64 build
   vm start dev              # shell exits -> VM stops
   vm start dev -k           # shell exits -> VM keeps running in the background
+  vm start dev --share-ssh  # also forward the host's SSH agent into the VM
   vm stop dev
   vm stop --all
   vm list
