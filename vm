@@ -111,7 +111,11 @@ validate_name() {
 }
 
 container_name() { echo "${PREFIX}-$1"; }
-volume_name()    { echo "${PREFIX}-$1-data"; }
+
+# host folder bind-mounted into the VM at $DATA_MOUNT; a real directory on
+# the host (visible in Finder, etc.), not a Docker-managed volume, so files
+# can be dropped in/out directly from either side
+data_host_dir() { echo "$HOME/vmm/$1"; }
 
 # names of all VMs managed by this tool (prefix stripped)
 all_vm_names() {
@@ -312,12 +316,12 @@ cmd_create() {
   validate_name "$name"
   vm_exists "$name" && err "VM '$name' already exists."
 
-  local cname vname
+  local cname data_dir
   cname="$(container_name "$name")"
-  vname="$(volume_name "$name")"
+  data_dir="$(data_host_dir "$name")"
 
-  echo "Creating persistent volume '$vname'..."
-  docker volume create "$vname" >/dev/null
+  echo "Creating persistent storage folder '$data_dir'..."
+  mkdir -p "$data_dir"
 
   local platform_args=()
   if [[ -n "$platform" ]]; then
@@ -332,13 +336,13 @@ cmd_create() {
     --name "$cname" \
     --label "$LABEL" \
     --label "vmm.name=$name" \
-    --volume "$vname:$DATA_MOUNT" \
+    --volume "$data_dir:$DATA_MOUNT" \
     --add-host "host.docker.internal:host-gateway" \
     --env "SSH_AUTH_SOCK=$SSH_AGENT_CONTAINER_SOCK" \
     --entrypoint tail \
     "$image" -f /dev/null >/dev/null
 
-  echo "VM '$name' created. Persistent storage mounted at '$DATA_MOUNT'."
+  echo "VM '$name' created. Persistent storage mounted at '$DATA_MOUNT' (also visible on the host at '$data_dir')."
   echo "Start it with: vm start $name"
 }
 
@@ -427,14 +431,14 @@ cmd_list() {
     return
   fi
 
-  printf "%-20s %-30s %-10s %-25s\n" "NAME" "IMAGE" "STATUS" "VOLUME"
+  printf "%-20s %-30s %-10s %s\n" "NAME" "IMAGE" "STATUS" "DATA DIR"
   while IFS= read -r cname; do
-    local name image status vname
+    local name image status data_dir
     name="${cname#${PREFIX}-}"
     image="$(docker inspect --format '{{.Config.Image}}' "$cname")"
     status="$(docker inspect --format '{{.State.Status}}' "$cname")"
-    vname="$(volume_name "$name")"
-    printf "%-20s %-30s %-10s %-25s\n" "$name" "$image" "$status" "$vname"
+    data_dir="$(data_host_dir "$name")"
+    printf "%-20s %-30s %-10s %s\n" "$name" "$image" "$status" "$data_dir"
   done <<< "$names"
 }
 
@@ -453,12 +457,12 @@ cmd_delete() {
     esac
   done
 
-  local cname vname
+  local cname data_dir
   cname="$(container_name "$name")"
-  vname="$(volume_name "$name")"
+  data_dir="$(data_host_dir "$name")"
 
   if [[ "$purge" == true && "$yes" != true ]]; then
-    read -r -p "This will permanently delete the data volume for '$name'. Continue? [y/N] " reply
+    read -r -p "This will permanently delete '$data_dir'. Continue? [y/N] " reply
     [[ "$reply" =~ ^[Yy]$ ]] || { echo "Aborted."; return; }
   fi
 
@@ -468,10 +472,10 @@ cmd_delete() {
   rm -rf "$(ssh_agent_host_dir "$name")"
 
   if [[ "$purge" == true ]]; then
-    docker volume rm "$vname" >/dev/null
+    rm -rf "$data_dir"
     echo "VM '$name' and its persistent data have been deleted."
   else
-    echo "VM '$name' deleted. Persistent data kept in volume '$vname' (use --purge to remove it)."
+    echo "VM '$name' deleted. Persistent data kept at '$data_dir' (use --purge to remove it)."
   fi
 }
 
@@ -480,7 +484,8 @@ usage() {
 vm - manage Docker containers as persistent "virtual machines"
 
 Usage:
-  vm create <name> <image> [options]  Create a new VM from a Docker image, with persistent storage
+  vm create <name> <image> [options]  Create a new VM from a Docker image, with persistent
+                                       storage at ~/vmm/<name> on the host, mounted at /data
     --platform <platform>       Force a specific platform, e.g. linux/amd64 (useful when an
                                  image has no native build for your CPU architecture)
   vm start <name> [options]  Start the VM (if needed) and open an interactive shell
@@ -494,7 +499,7 @@ Usage:
   vm list                    List all VMs
   vm delete <name> [options] Delete a VM
     -y, --yes                 Skip confirmation prompt
-    --purge                    Also delete the VM's persistent data volume
+    --purge                    Also delete the VM's persistent data folder (~/vmm/<name>)
 
 Examples:
   vm create dev ubuntu:22.04

@@ -52,7 +52,7 @@ vm stop <name | -a | --all>  Stop the VM, or all VMs (data, container, and any a
 vm list                      List all VMs
 vm delete <name> [options]   Delete a VM
   -y, --yes                    Skip confirmation prompt
-  --purge                       Also delete the VM's persistent data volume
+  --purge                       Also delete the VM's persistent data folder (~/vmm/<name>)
 ```
 
 ### Example
@@ -65,6 +65,31 @@ exit                 # VM stops automatically
 vm start dev         # same container, same filesystem state
 vm list
 vm delete dev --purge
+```
+
+### Sharing files with the host
+
+`/data` inside the VM is bind-mounted straight to `~/vmm/<name>` on the
+host — a real folder, not a Docker-managed volume — so files you drop into
+either side show up on the other immediately, no copying needed:
+
+```sh
+vm start dev
+echo hi > /data/note.txt   # from inside the VM
+exit
+cat ~/vmm/dev/note.txt      # from the host — same file
+```
+
+VMs created before this feature was added still use an old Docker-managed
+volume instead of a host folder (mounts are fixed at `vm create` time, so
+existing VMs aren't affected automatically). To move one over, copy its data
+out, delete it, then recreate it — the volume itself isn't removed unless
+you also run `docker volume rm vmm-<name>-data`:
+
+```sh
+docker cp vmm-<name>:/data ~/vmm/<name>   # copy old volume's contents out
+vm delete <name>
+vm create <name> <same-image>
 ```
 
 Pass `-k`/`--keep-running` to leave the VM running in the background after
@@ -124,11 +149,12 @@ containers on the same host.
 - Each VM is a Docker container named `vmm-<name>`, kept alive in the
   background with `tail -f /dev/null` so it can be started once and shelled
   into any number of times.
-- Persistent storage is a dedicated named Docker volume (`vmm-<name>-data`)
-  mounted at `/data` inside the container.
+- Persistent storage is a plain host folder, `~/vmm/<name>`, bind-mounted at
+  `/data` inside the container — a real directory you can open, edit, and
+  drop files into directly, not a Docker-managed volume.
 - `vm start` opens `bash` if available in the image, falling back to `sh`.
-- `vm delete` removes the container but keeps the data volume by default;
-  pass `--purge` to delete the volume too.
+- `vm delete` removes the container but keeps `~/vmm/<name>` by default;
+  pass `--purge` to delete it too.
 - All VMs are tagged with the `vmm.managed=true` label so the tool only ever
   touches containers/volumes it created.
 - Each VM is created with `SSH_AUTH_SOCK` pointing at a fixed in-container
